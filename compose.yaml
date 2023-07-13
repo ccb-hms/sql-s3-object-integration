@@ -1,0 +1,90 @@
+# Stands up minio S3 server along side a Polybase-enabled MS SQL Server
+#
+# BUILDKIT_PROGRESS=plain docker-compose up --build -d
+
+version: '3'
+
+services:
+
+  # generate certificates
+  config:
+    build:
+      context: .
+      dockerfile: Containers/SSL.Dockerfile
+    volumes:
+      - ./Data/openssl.cnf:/tmp/certs/openssl.cnf
+      - ./Data/certs:/certs
+    command: openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout /certs/private.key -out /certs/public.crt -config /tmp/certs/openssl.cnf
+
+  # run the S3 service
+  minio1:
+    image: quay.io/minio/minio:RELEASE.2023-06-29T05-12-28Z
+    depends_on: 
+      - config
+    hostname: minio1
+    networks:
+      s3-net:
+        ipv4_address: 172.21.0.20
+    extra_hosts:
+      - "s3.example.com:172.21.0.20"
+    ports:
+      - 9000:9000
+      - 9001:9001
+    volumes:
+      - ./Data/certs:/root/.minio/certs/
+      
+    environment:
+      - MINIO_ROOT_USER=MYROOTUSER
+      - MINIO_ROOT_PASSWORD=MYROOTPASSWORD
+    command: server /data --console-address ":9001" 
+
+  # create an S3 bucket in minio
+  createbucket:
+    image: minio/mc:RELEASE.2023-06-28T21-54-17Z
+    networks:
+      s3-net:
+    extra_hosts:
+      - "s3.example.com:172.21.0.20"
+    depends_on:
+      - minio1
+    volumes:
+      - ./Data:/tmp/hostdata
+    entrypoint: /bin/sh -c "/usr/bin/mc alias set s3admin https://s3.example.com:9000 MYROOTUSER MYROOTPASSWORD --api S3v4 --insecure; 
+                            /usr/bin/mc admin user add s3admin/ miniouser miniopassword --insecure;
+                            /usr/bin/mc admin policy attach s3admin/ readwrite --user=miniouser --insecure;
+                            /usr/bin/mc alias set miniouser https://s3.example.com:9000 miniouser miniopassword --insecure;
+                            /usr/bin/mc mb miniouser/sqldatavirt  --insecure;
+                            /usr/bin/mc cp /tmp/hostdata/helloworld.csv miniouser/sqldatavirt/helloworld.csv --insecure;"
+
+  # run SQL Server with Polybase enabled
+  sql1:
+    build:
+      context: .
+      dockerfile: Containers/SqlServerPolybase.Dockerfile
+    depends_on: 
+      - config
+      - createbucket
+      - minio1
+    hostname: sql1
+    networks:
+      - s3-net
+    extra_hosts:
+      - "s3.example.com:172.21.0.20"
+    ports:
+      - 1433:1433
+    volumes:
+      - ./Data/certs/public.crt:/var/opt/mssql/security/ca-certificates/public.crt:ro
+    environment:
+      - ACCEPT_EULA=Y
+      - MSSQL_SA_PASSWORD=yourStrong(!)Password
+    # uncomment next two lines to get interactive shell with docker-compose exec sql1 bash
+    # stdin_open: true 
+    # tty: true
+    platform: linux/amd64
+
+networks:
+  s3-net:
+    ipam:
+      driver: default
+      config:
+        - subnet: "172.21.0.0/24"
