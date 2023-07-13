@@ -1,243 +1,27 @@
 # sql-s3-object-integration
 
-In this repo, you'll find two example environments for using SQL Server 2022's s3 object integration.  One for [backup and restore](#backup-and-restore-test-environment) to s3 compatible object storage and the other for [data virtualization](#polybase-and-s3-data-virtualiation-enviroment) using Polybase connectivity to s3 compatible object storage.  This work aims to get you up and running as quickly as possible to work with these new features.  I implemented this in Docker Compose since that handles all the implementation and configuration steps for you.
+This repository is derived from Anthony Nocentino's [excellent examples of running SQL Server with S3 object 
+storage integration](https://github.com/nocentino/sql-s3-object-integration).  It is a trimmed-down and reorganized 
+version of his work that provides a light-weight SQL Server container running alongside a minio S3 server.  This allows 
+the user to do makeshift analyses of the file formats (e.g., parquet, csv) 
+that are supported by SQL Server's Polybase data virtualization technology. 
 
-In my post [Setting up MinIO for SQL Server 2022 s3 Object Storage Integration](https://www.nocentino.com/posts/2022-06-10-setting-up-minio-for-sqlserver-object-storage/) we did this step by step at the command line. Using Docker Compose it will do all the hard work for you and you can get up and running fast. 
+To get started, build and run up the containers with something like:
 
-Let's walk through what you'll get in each of these environments. 
+`BUILDKIT_PROGRESS=plain docker-compose up --build -d`
 
-## Backup and Restore Test Environment
+Once the containers are running, you can upload files into the S3 service by aiming you web browser at 
+port 9000 over an HTTPS connection on the host where the containers are running.  For example, if 
+you are running the browser on the same host where the containers are running, you can navigate to:
 
-Up first is Backups. In this repo's [`backup`](https://github.com/nocentino/sql-s3-object-integration/tree/main/backup) directory, there's a script [`demo.sh`](https://github.com/nocentino/sql-s3-object-integration/blob/main/backup/demo.sh).  In this script, you will find the commands needed to start the environment and do a basic connectivity test using a SQL Server backup.  To start everything up, you'll change into the [`backup`](https://github.com/nocentino/sql-s3-object-integration/tree/main/backup) directory and run `docker-compose up --detach`. At this point, you'll have a functioning enviroment, but let's dig into the details of how this is implemented in docker compose.
+`https://localhost:9000`
 
-```
-docker-compose up --detach
-```
+The default username for the minio service is `MYROOTUSER` and the default password is `MYROOTPASSWORD`.
 
-First, since SQL Server's s3 object integration requires a valid and trusted certificate, a service named `config` runs a container that creates the required certificate needed for this environment and stores them in the current working directory in a subdirectory named `certs`.
+The ports, passwords, etc., can be modified by editing `compose.yaml` and `Containers/SqlServerPolybase.Dockerfile`.
 
-```
-  config:
-    build:
-      context: .
-      dockerfile: dockerfile.ssl
-    volumes:
-      - ./openssl.cnf:/tmp/certs/openssl.cnf
-      - ./certs:/certs
-    command: openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout /certs/private.key -out /certs/public.crt -config /tmp/certs/openssl.cnf
-```
+The default password for the `sa` account on SQL Server is `yourStrong(!)Password`.
 
-Second, we start a service named `minio1` that starts a MinIO container on a static IP address of `172.18.0.2` and exposes the data and admin ports on `9000` and `9001`.  There are also two volumes defined a data volume `s3-data` for the object data stored in MinIO, and the other, `certs` is a bind mount exposing the certificates into the MinIO container for use TLS connections.  MinIO automatically configures itself for TLS connectivity when it finds certificates in this location.  The final configurations are the root username and password environment variables and the `command` starting up the container. 
+You can connect to the SQL Server instance using any of the standard management / query tools (Azure Data Studio, SQL Server Management Studio, etc.).
 
-```
-  minio1:
-    image: quay.io/minio/minio
-    depends_on: 
-      - config
-    hostname: minio1
-    networks:
-      s3-data:
-        ipv4_address: 172.18.0.20
-    extra_hosts:
-      - "s3.example.com:172.18.0.20"
-    ports:
-      - 9000:9000
-      - 9001:9001
-    volumes:
-      - s3-data:/data
-      - ./certs:/root/.minio/certs/
-    environment:
-      - MINIO_ROOT_USER=MYROOTUSER
-      - MINIO_ROOT_PASSWORD=MYROOTPASSWORD
-    command: server /data --console-address ":9001" 
-```
-
-Next, the `createbucket` service creates a user in MinIO that we will use inside SQL Server to access MinIO and also creates a bucket named `sqlbackups` for our backup and restore testing.
-
-```
-  createbucket:
-    image: minio/mc
-    networks:
-      s3-data:
-    extra_hosts:
-      - "s3.example.com:172.18.0.20"
-    depends_on:
-      - minio1
-    entrypoint: /bin/sh -c "/usr/bin/mc alias set s3admin https://s3.example.com:9000 MYROOTUSER MYROOTPASSWORD --api S3v4 --insecure;
-                            /usr/bin/mc admin user add s3admin anthony nocentino --insecure;
-                            /usr/bin/mc admin policy set s3admin readwrite user=anthony --insecure;
-                            /usr/bin/mc alias set anthony https://s3.example.com:9000 anthony nocentino --insecure;
-                            /usr/bin/mc mb anthony/sqlbackups  --insecure;"
-```
-
-Finally, we start a service named `sql1`, which runs the latest published container image for SQL Server 2022 `mcr.microsoft.com/mssql/server:2022-latest`.  In this service, we add an `extra_host` so that the SQL Server container can resolve the DNS name of our MinIO container so that it can make the proper TLS connection.  There is a data volume for our SQL Server data `sql-data`, and we're using a bind mount to expose the MinIO container's public certificate into SQL Server to that it's trusted using the code `./certs/public.crt:/var/opt/mssql/security/ca-certificates/public.crt:ro`. 
-
-```
-  sql1:
-    image: mcr.microsoft.com/mssql/server:2022-latest
-    depends_on: 
-      - config
-      - createbucket
-      - minio1
-    hostname: sql1
-    networks:
-      - s3-data
-    extra_hosts:
-      - "s3.example.com:172.18.0.20"
-    ports:
-      - 1433:1433
-    volumes:
-      - sql-data:/var/opt/mssql
-      - ./certs/public.crt:/var/opt/mssql/security/ca-certificates:ro
-    environment:
-      - ACCEPT_EULA=Y
-      - MSSQL_SA_PASSWORD=S0methingS@Str0ng!
-```
-
-Once the containers are up and running, you'll want to create a database, create a credential for access to your s3 bucket in MinIO, then run a backup.  Here's some example code to backup to our MinIO container. 
-
-Create a database in SQL Server
-```
-CREATE DATABASE TESTDB1
-```
-
-Create the S3 credential in SQL Server
-```
-CREATE CREDENTIAL [s3://s3.example.com:9000/sqlbackups] WITH IDENTITY = 'S3 Access Key', SECRET = 'anthony:nocentino'
-```
-
-Run the backup to the s3 target
-```
-BACKUP DATABASE TestDB1 TO URL = 's3://s3.example.com:9000/sqlbackups/TestDB1.bak' WITH COMPRESSION, STATS = 10, FORMAT, INIT
-```
-
-When you're all finished, you can use `docker-compose down --rmi local --volumes` to stop all the containers and destroy all the images and volumes associated with this environment.
-
-
-## Polybase and s3 Data Virtualization Environment
-
-Up next is Data Virtualization. In this repo's [`polybase`](https://github.com/nocentino/sql-s3-object-integration/tree/main/polybase) directory, there's a script [`demo.sh`](https://github.com/nocentino/sql-s3-object-integration/blob/main/polybase/demo.sh).  This script has the commands you'll need to start up the environment and do a basic connectivity test using Polybase-based access to s3-compatible object storage.  To start everything up, you'll change into the [`polybase`](https://github.com/nocentino/sql-s3-object-integration/tree/main/polybase) directory and run `docker-compose up --build --detach`.  This docker-compose manifest will do a few things...let's walk through that.
-
-This docker-compose manifest starts the same as the backup one above.  But in addition to that, it creates the certificate needed, starts a configured MinIO container, and then creates the required user and bucket in MinIO.  It also copies a simple CSV file into the MinIO container.  This is the data we'll access from SQL Server via Polybase over s3. 
-
-Since Polybase isn't enabled by default in the published container image `mcr.microsoft.com/mssql/server:2022-latest`, we have to build a container image for SQL Server with Polybase installed.  And that's what we're doing in the `sql1` service in the dockerfile named [`dockerfile.sql`](https://github.com/nocentino/sql-s3-object-integration/blob/main/polybase/dockerfile.sql). 
-
-### Start up the environment
-
-Once you're ready to go, start up the environment with `docker-compose up --build --detach` and follow the steps in [`demo.sh`](https://github.com/nocentino/sql-s3-object-integration/blob/main/polybase/demo.sh).
-
-With the SQL Server container up and running, let's walk through the steps to access data on s3 compatible object storage. All this code is in [`demo.sql`](https://github.com/nocentino/sql-s3-object-integration/blob/main/polybase/demo.sql) in the repo. But I want to walk you through it here too. 
-
-### Configure Polybase in SQL Server instance 
-
-Confirm if the Polybase feature is installed, 1 = installed
-
-```
-SELECT SERVERPROPERTY ('IsPolyBaseInstalled') AS IsPolyBaseInstalled;
-```
-
-Next, enable Polybase in your instance's configuration
-```
-exec sp_configure @configname = 'polybase enabled', @configvalue = 1;
-```
-
-Confirm if Polybase is in your running config, run_value should be 1
-```
-exec sp_configure @configname = 'polybase enabled'
-```
-
-### Configure access to external data using Polybase over S3
-
-Create a database to hold objects for the demo
-```
-CREATE DATABASE [PolybaseDemo];
-```
-
-Switch into the database context for the PolybaseDemo database
-```
-USE PolybaseDemo
-```
-
-Create a database master key, this is use to protect the credentials you're about to create
-```
-CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'S0methingS@Str0ng!';  
-```
-
-Create a database scoped credential, this should have at minimum ReadOnly and ListBucket access to the s3 bucket
-```
-CREATE DATABASE SCOPED CREDENTIAL s3_dc WITH IDENTITY = 'S3 Access Key', SECRET = 'anthony:nocentino' ;
-```
-
-Before you create the external data source, you need to restart the SQL Server container.  To restart your a container started by `docker-compose` you can use this:
-```
-docker-compose restart sql1
-```
-
-If you don't restart the SQL Server container you'll get this error:
-```
-Msg 46530, Level 16, State 11, Line 1
-External data sources are not supported with type GENERIC.
-```
-
-
-Create your external datasource on your s3 compatible object storage, referencing where it is on the network `LOCATION`, and the credential you just defined
-
-```
-CREATE EXTERNAL DATA SOURCE s3_ds
-WITH
-(    LOCATION = 's3://s3.example.com:9000/'
-,    CREDENTIAL = s3_dc
-)
-```
-
-First, we can access data in the s3 bucket and for a simple test, let's start with CSV.  During the docker compose up, the build copied a CSV into the bucket it created.  This should output `Hello World!`
-```
-SELECT  * 
-FROM OPENROWSET
-(    BULK '/sqldatavirt/helloworld.csv'
-,    FORMAT       = 'CSV'
-,    DATA_SOURCE  = 's3_ds'
-) 
-WITH ( c1 varchar(50) )             
-AS   [Test1]
-```
-
-`OPENROWSET` is cool for infrequent access, but if you want to layer on SQL Server security or use statistics on the data in the external data source,
- let's create an external table.  This first requires defining an external file format.  In this example, its CSV
-
-```
-CREATE EXTERNAL FILE FORMAT CSVFileFormat
-WITH
-(    FORMAT_TYPE = DELIMITEDTEXT
-,    FORMAT_OPTIONS  ( FIELD_TERMINATOR = ','
-,                      STRING_DELIMITER = '"'
-,                      FIRST_ROW = 1 )
-);
-```
-
-Next, we define the table's structure.  The CSV here is mega simple, just a couple rows with a two columns. When defining the external table where the data lives on our network with `DATA_SOURCE`, the `LOCATION` within that `DATA_SOURCE` and the `FILE_FORMAT`
-```
-CREATE EXTERNAL TABLE HelloWorld ( c1 varchar(50) )
-WITH (
-     DATA_SOURCE = s3_ds
-,    LOCATION = '/sqldatavirt/helloworld.csv'
-,    FILE_FORMAT = CSVFileFormat
-);
-```
-
-Now we can access the data just like any other table in SQL server. 
-```
-SELECT * FROM [HelloWorld];
-```
-
-## A note about Polybase using containers with default settings
-
-If you get this error below, you will want to increase the memory resource in your Docker configuration. The default is 2GB, I set it to 4GB an all worked. 
-
-```
-2022-08-13 13:09:43.22 spid41s     There is insufficient system memory in resource pool 'internal' to run this query.
-```
-
-## Wrap things up
-
-When you're done, you can use `docker-compose down --volumes  --rmi local` to clean up all the resources, images, network, and the volumes holding the database in the databases and MinIO.
+See `Demo/demo.sql` for an example query against a small CSV file that gets loaded into the S3 container at build time.
